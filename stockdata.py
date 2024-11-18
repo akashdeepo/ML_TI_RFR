@@ -1,139 +1,71 @@
-# stock_data.py
+# stockdata.py
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
 import copy
-
-"""
-  CJM: I originally had written this class to perform a built-in mean 0, std 1 scaling.
-  I've since changed my mind - I think the model should be responsible for doing its
-  own scaling, if necessary. Some models, like RFR, don't require any scaling and doing
-  it here could potentially cause some confusion/bugs to creep in.
-"""
-    
 
 
 class StockData:
+    ########################################################################
     def __init__(self,
                  filepath,
                  technical_indicator_list=[],
                  test_frac=0.2,
-                 tod_start='09:00',
+                 test_size=None, # This overrides test_frac, without checking!
+                 test_start_date=None, # start/stop override both of the above.
+                 test_stop_date=None,
+                 tod_start='9:00',
                  tod_end='14:30',
                  delta_t=1):
-        """
-        Initialize StockData with improved timezone and dividend handling.
-       
-        Parameters:
-        filepath : str, path to CSV file
-        technical_indicator_list : list of technical indicators to compute
-        test_frac : float, fraction of data to use for testing
-        tod_start : str, trading day start time (CST)
-        tod_end : str, trading day end time (CST)
-        delta_t : int, prediction time delta
+        """ filepath                : full path to a CSV file with stock data.
+            technical_indicator_list: a list of strings describing the technical indicators
+                                      to compute and insert.
+            delta_t                 : Number of timesteps (e.g. minutes) into the future we
+                                      will try to predict.
         """
         self.delta_t = delta_t
         self.tod_start = tod_start
         self.tod_end = tod_end
-       
-        if not self.load_file(filepath):
+        if not(self.load_file(filepath)):
             return
-           
-        # List of known dividend dates and amounts
+        
+        # List of known dividend dates and amounts for SPY; really these data should be
+        # in the csv and extracted from there. But this is a quick workaround for the present needs.
         dividends = [{'ex_date': '2024-09-20', 'amount': 1.745531}]  # Add more dates as needed
 
-        # Adjust prices for dividends
-        self.adjust_for_dividends(dividends)
+        
+        # Compute log-returns, target column,...
+        self.preprocess_data(dividends)
 
-        self.preprocess_data()
+        # Compute technical indicators using all available data, including after-hours.
         self.compute_indicators(technical_indicator_list)
         self.data.dropna(inplace=True)
+
+        # Filter to the Times Of Day in which we're interested.
         self.apply_TOD_filter()
-        self.train_size = int(len(self.data)*(1-test_frac))
 
-    def adjust_for_dividends(self, dividends):
-        """
-        Adjusts historical prices for dividends to ensure continuity.
-        
-        Parameters:
-        dividends : list of dicts
-            List of dividends with 'ex_date' and 'amount' keys.
-        """
-        for dividend in dividends:
-            ex_date = pd.Timestamp(dividend['ex_date'])
-            amount = dividend['amount']
-
-            # Find the last price before the ex-dividend date
-            last_price_before_dividend = self.data.loc[:ex_date - pd.Timedelta(days=1), 'close'].iloc[-1]
-
-            # Calculate the adjustment factor
-            adjustment_factor = (last_price_before_dividend - amount) / last_price_before_dividend
-
-            # Apply the adjustment factor to prices before the ex-dividend date
-            self.data.loc[:ex_date - pd.Timedelta(days=1), ['open', 'high', 'low', 'close']] *= adjustment_factor
-
-            print(f"Adjusted prices before {ex_date} by factor {adjustment_factor:.5f} for dividend of {amount}")
-
-    def apply_TOD_filter(self):
-        """Apply time-of-day filter with improved timezone handling."""
-        if self.data.index.tz is None:
-            print("Note: Timestamps are assumed to be in CST")
-       
-        self.data = self.data.between_time(self.tod_start, self.tod_end)
-        if len(self.data) == 0:
-            raise ValueError(f"No data found between {self.tod_start} and {self.tod_end}")
-
-    def load_file(self, filepath):
-        try:
-            self.data = pd.read_csv(filepath, parse_dates=['timestamp'], index_col='timestamp')
-            return True
-        except:
-            print(f"StockData.load_file(): failed to load {filepath}.")
-            self.data = None
-            return False
-
-    def preprocess_data(self):
-        VOL_SCALE_WINDOW = 60
-        self.data.sort_values(by='timestamp', ascending=True, inplace=True)
-       
-        # Convert open, high, low, close columns to be log-relative to the previous close
-        for col in ['open', 'high', 'low', 'close']:
-            self.data[f'lr_{col}'] = np.log(self.data[col] / self.data[col].shift(1))
-
-        self.target_column_name = f'lr_close_(t+{self.delta_t})'
-        self.data[self.target_column_name] = self.data['lr_close'].shift(-self.delta_t)
-
-        rolling_mean = self.data['volume'].rolling(VOL_SCALE_WINDOW).mean()
-        rolling_std = self.data['volume'].rolling(VOL_SCALE_WINDOW).std()
-        self.data[f'volz{VOL_SCALE_WINDOW}'] = (self.data['volume'] - rolling_mean) / rolling_std
-       
-        self.data.dropna(inplace=True)
+        # Determine the size of the test set. There are three ways this can be done:
+        # (1) By test_frac,
+        # (2) By test_size, which overrides test_frac,
+        # (3) By test_start_date, which overrides both of the above.
+        # But in any case, the test set will be aligned to the beginning of a day
+        # (so your test set better be larger than a day or you're in trouble anyway).
+        self.test_size = int(len(self.data)*test_frac)
+        if not(test_size is None):
+            self.test_size = test_size
+        # Now, determine pd.Timestamp boundaries from the test size, so that
+        # the test set will start cleanly on one date and end cleanly on the last.
+        self.test_start_date = self.data.index[-self.test_size].round('d')
+        self.test_stop_date = self.data.index[-1] + 1*pd.Timedelta('0:1:0') # Add one minute since the last is excluded.
+        if not(test_start_date is None):
+            self.test_start_date = test_start_date
+        if not(test_stop_date is None):
+            self.test_stop_date = test_stop_date + 1*pd.Timedelta('0:1:0')
+            
+    ########################################################################
+    def get_test_size(self):
+        return self.test_size
     
-    def get_train_test_dates(self):
-        """
-        Retrieve the start and end dates for the train and test sets.
-
-        Returns:
-        --------
-        dict : Contains train and test start and end dates
-        """
-        train_start = self.data.index[0]
-        train_end = self.data.index[self.train_size - 1]
-        test_start = self.data.index[self.train_size]
-        test_end = self.data.index[-1]
-       
-        return {
-            'train_start': train_start,
-            'train_end': train_end,
-            'test_start': test_start,
-            'test_end': test_end
-        }
-
-    # Additional methods for compute_indicators, get_train_set, get_test_set, etc. go here
-
-        
-                
     ########################################################################
     def compute_indicators(self, technical_indicator_list):
         ind_method_dict = {"sma":self.calculate_sma,
@@ -166,14 +98,42 @@ class StockData:
             return False
 
     ########################################################################
-    def preprocess_data(self):
+    def adjust_for_dividends(self, dividends):
+        """
+        Adjusts historical prices for dividends to ensure continuity.
+        
+        Parameters:
+        dividends : list of dicts
+            List of dividends with 'ex_date' and 'amount' keys.
+        """
+        for dividend in dividends:
+            ex_date = pd.Timestamp(dividend['ex_date'])
+            amount = dividend['amount']
+
+            # Find the last price before the ex-dividend date
+            last_price_before_dividend = self.data.loc[:ex_date - pd.Timedelta(days=1), 'close'].iloc[-1]
+
+            # Calculate the adjustment factor
+            adjustment_factor = (last_price_before_dividend - amount) / last_price_before_dividend
+
+            # Apply the adjustment factor to prices before the ex-dividend date
+            self.data.loc[:ex_date - pd.Timedelta(days=1), ['open', 'high', 'low', 'close']] *= adjustment_factor
+
+            print(f"Adjusted prices before {ex_date} by factor {adjustment_factor:.5f} for dividend of {amount}")
+        
+
+    ########################################################################
+    def preprocess_data(self, dividends=None):
         VOL_SCALE_WINDOW = 60
         self.data.sort_values(by='timestamp', ascending=True, inplace=True)
+        if not(dividends is None):
+            self.adjust_for_dividends(dividends)
         
-        # Convert open, high, low, close columns to be log-relative to the previous close.(Updated as per Dr.Rachev instructions)
+        # Convert open, high, low, close columns to be log-relative to the previous close.
+        # Changed these to be relative to themselves, as per Zari.
         for col in ['open', 'high', 'low', 'close']:
+            #self.data[f'lr_{col}'] = np.log(self.data[col] / self.data['close'].shift(1))
             self.data[f'lr_{col}'] = np.log(self.data[col] / self.data[col].shift(1))
-
             
         # The target column is lr_close, shifted by -self.delta_t because the data are
         # sorted ascending in time; thus, for example, the 12:01 lr_close will land
@@ -207,8 +167,11 @@ class StockData:
         # Return trainX, trainY DataFrame and Series.
         features = self.feature_column_names()
         t = self.target_column_name
-        trainX = self.data[features][:self.train_size].copy()
-        trainY = self.data[t][:self.train_size].copy()
+        #trainX = self.data[features][:-self.test_size].copy()
+        #trainY = self.data[t][:-self.test_size].copy()
+        t0,t1 = self.get_train_date_range()
+        trainX = self.data[features][t0:t1].copy()
+        trainY = self.data[t][t0:t1].copy()
         return trainX, trainY
       
     #######################################################################
@@ -216,31 +179,55 @@ class StockData:
         # Return testX, testY DataFrame and Series.
         features = self.feature_column_names()
         t = self.target_column_name
-        testX = self.data[features][self.train_size:].copy()
-        testY = self.data[t][self.train_size:].copy()
+        #testX = self.data[features][-self.test_size:].copy()
+        #testY = self.data[t][-self.test_size:].copy()
+        testX = self.data[features][self.test_start_date:self.test_stop_date]
+        testY = self.data[t][self.test_start_date: self.test_stop_date]
         return testX, testY
       
     #######################################################################
     def get_train_date_range(self):
         # Returns t0,t1 Timestamp objects.
         t0 = self.data.index[0]
-        t1 = self.data.index[self.train_size-1]
+        t1 = self.data[:self.test_start_date].index[-1]
         return t0,t1
       
     #######################################################################
     def get_test_date_range(self):
         # Returns t0,t1 Datetime objects.
-        t0 = self.data.index[self.train_size]
-        t1 = self.data.index[-1]
+        t0 = self.test_start_date
+        t1 = self.test_stop_date
         return t0, t1
+
+    #######################################################################
+    def get_train_test_dates(self):
+        """
+        Retrieve the start and end dates for the train and test sets.
+
+        Returns:
+        --------
+        dict : Contains train and test start and end dates
+        """
+        train_start, train_end = self.get_train_date_range()
+        test_start, test_end = self.get_test_date_range()
+        return {
+            'train_start': train_start,
+            'train_end': train_end,
+            'test_start': test_start,
+            'test_end': test_end
+        }
+
+
     
     #######################################################################
     def get_train_index_list(self):
-        return self.data.index[:self.train_size]
+        t0, t1 = self.get_train_date_range()
+        return self.data.between_time(t0, t1).index
 
     #######################################################################
     def get_test_index_list(self):
-        return self.data.index[self.train_size:]
+        t0, t1 = self.get_test_date_range()
+        return self.data.between_time(t0, t1).index
     
     #######################################################################
     def price_at_time(self, t): 
@@ -290,6 +277,7 @@ class StockData:
         
         self.data['r_MACD'] = (MACD_line - signal_line) / (0.5 * (np.abs(MACD_line) + np.abs(signal_line)))
         # Updated The MACD FORMULA
+
 
         
     #######################################################################
