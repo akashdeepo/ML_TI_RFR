@@ -31,8 +31,8 @@ This repository contains the implementation of a comprehensive stock market tech
 
 Clone the repository:
 ```bash
-git clone https://github.com/yourusername/stock-analysis-framework.git
-cd stock-analysis-framework
+git clone [https://github.com/akashdeepo/ML_TI_RFR.git]
+cd ML_TI_RFR
 ```
 
 Install required packages:
